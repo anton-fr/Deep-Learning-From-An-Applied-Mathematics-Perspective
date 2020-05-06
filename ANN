@@ -1,0 +1,340 @@
+import os,sys
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+from torch import optim
+from sklearn.datasets import make_classification, make_circles, make_moons, make_gaussian_quantiles
+from sklearn.model_selection import StratifiedShuffleSplit
+import numpy as np
+import matplotlib.pyplot as plt
+import imageio
+from pathlib import Path
+from mlxtend.plotting import plot_decision_regions
+
+
+class DummyDataGenerator():
+	# TODO: normaliser?
+
+	def __init__(self, n_samples=4e3):
+
+		self.n_samples = int(n_samples)
+
+	def split_data(self, feature_matrix, label_vec):
+
+		stratified_splitter = StratifiedShuffleSplit(n_splits=1,test_size=.5, random_state=420)
+		label_vec = np.reshape(label_vec,(-1,1))
+		label_vec = np.concatenate((label_vec,1-label_vec),axis=1)
+
+
+		for train_index, test_index in stratified_splitter.split(np.zeros(feature_matrix.shape[0]), label_vec[:,0]):
+
+			x_training, x_validation = feature_matrix[train_index], feature_matrix[test_index]
+			y_training, y_validation = label_vec[train_index], label_vec[test_index]
+
+		
+		data_container = {
+				'x_full': feature_matrix,
+				'x_train': x_training,
+				'x_test': x_validation,
+				'y_full': label_vec,
+				'y_train': y_training,
+				'y_test': y_validation,
+				}
+
+		return data_container
+
+
+	def get_moons_data(self, noise=.4 ):
+
+			x, y = make_moons(
+				n_samples=int(self.n_samples),
+				shuffle=True,
+				noise=noise,
+				random_state=420,
+				)
+
+			return self.split_data(x, y)
+
+	def get_paper_data(self):
+		
+			X =np.array([[0.1,0.1],[0.3,0.4],[0.1,0.5],[0.6,0.9],[0.4,0.2],[0.6,0.3],[0.5,0.6],[0.9,0.2],[0.4,0.4],[0.7,0.6],[0.3,0.7]])
+			y=np.array([0,0,0,0,0,1,1,1,1,1,1])
+		
+			return self.split_data(X,y)
+
+		
+
+	def make_scatter_plot(self, dummy_data, figure_name):
+
+		x0 = dummy_data['x_full'][dummy_data['y_full'][:,0] == 0 ]
+		x1 = dummy_data['x_full'][dummy_data['y_full'][:,0] == 1 ]
+
+		plt.figure(figsize=(12,12))
+
+		plt.scatter(x0[:,0], x0[:,1],s=1, c='r', label='y=0')
+		plt.scatter(x1[:,0], x1[:,1],s=1, c='g', label='y=1')
+		plt.grid()
+		plt.legend()
+		plt.title(figure_name)
+		plt.show()
+		#plt.savefig(figure_name + '.pdf')
+		#plt.close()
+
+
+class MyDataset(Dataset):
+	def __init__(self, features, labels):
+        # here you can read the data from its original source (ex:, read a csv)
+        # you can also transform it and preprocess the dataset in here (ex: tokenize, remove NAs)
+        # you can include torchvision tranforms in here too
+        # and of course include any necessary parameters (ex: *args, **kwargs)
+		self.labels = labels
+		self.features = features
+
+	def __getitem__(self, index):
+		# you must define a method to return the ith input and label of each instance
+		# ex: return data[i], label[i]
+		x = self.features[index, :]
+		y = self.labels[index]
+		return x,y
+
+	def __len__(self):
+		# here you should return the length of your dataset
+		# ex: return len(data)
+		return len(self.labels)
+
+# define the network class
+#inherits nn.Module form pytorch
+class MyNetwork(nn.Module):
+
+    def __init__(self):
+        # call constructor from superclass
+        super().__init__()
+        
+        # define network layers
+        self.fc0 = nn.Linear(2, 64)
+        self.fc1 = nn.Linear(64, 128)
+        self.fc2 = nn.Linear(128, 2)
+
+    def forward(self, x):
+        # define forward pass
+        
+        x = torch.sigmoid(self.fc0(x.float()))
+        x = torch.sigmoid(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))
+
+
+        return x
+
+class loss(nn.MSELoss):
+
+	def forward(self, input, target):
+		target=target.float()
+		return F.mse_loss(input, target, reduction=self.reduction)
+
+class NetworkTrainer():
+	
+	def __init__(self, learning_rate=0.05, batch_size=1, validation_freq=25,data_mode='moons'):
+		self.data_mode=data_mode
+		data_generator=DummyDataGenerator()
+		self.loaded_data = data_generator.get_moons_data()
+
+
+		epochs=int(4e5/len(self.loaded_data['x_train']))*batch_size
+		iterations=epochs*len(self.loaded_data['x_train'])/batch_size
+		print('total number of iterations for training: '+ str(int(iterations)))
+		self.epochs = epochs
+		
+		self.learning_rate = learning_rate
+		self.batch_size = batch_size
+		self.validation_freq = validation_freq
+
+
+		self.train_loss_vec = []
+		self.val_loss_vec = []
+		self.gradient_abs_vec = []
+		self.gradient_average_abs_vec = []
+
+		self.gradient_counter = []
+		self.epoch_counter_train = 0
+		self.epoch_counter_val = []
+		self.criterion_loss=loss()
+		self.model=MyNetwork()
+		
+		self.optimizer = optim.SGD(self.model.parameters(), lr=learning_rate)
+		#self.optimizer= optim.SGD(self.model.parameters(), lr=learning_rate,momentum=0.9)
+		#self.opt='SGD'
+		#self.optimizer = torch.optim.Adam(self.model.parameters(),lr=learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0,amsgrad=False)
+
+
+		training_data = MyDataset(self.loaded_data['x_train'],self.loaded_data['y_train'])
+		validation_data = MyDataset(self.loaded_data['x_test'], self.loaded_data['y_test'])
+		
+		self.training_loader = DataLoader(training_data,batch_size=self.batch_size, shuffle=True, num_workers=0, drop_last=False)
+		self.validation_loader = DataLoader(validation_data,batch_size=self.batch_size, shuffle=True, num_workers=0, drop_last=False)
+
+		self.train()
+
+	def train(self):
+		n_epochs = self.epochs # this is a hyperparameter you'll need to define
+		
+		for epoch in range(n_epochs):
+			#print(list(self.model.parameters()))
+			self.model.train()
+			training_loss = 0.
+			#count=0
+			for data, target in self.training_loader:
+				#count+=1
+				# clear the old gradients from optimized variables
+				self.optimizer.zero_grad()
+				# forward pass: feed inputs to the model to get outputs
+				output = self.model(data)
+				# calculate the training batch loss
+				loss = self.criterion_loss(output, target)
+				
+				# backward: perform gradient descent of the loss w.r. to the model params
+				loss.backward()
+				
+				gradients = torch.stack([torch.sum(abs(x.grad.data)) for x in self.model.parameters()])
+				self.gradient_abs_vec.append(gradients)
+
+				# update the model parameters by performing a single optimization step
+				self.optimizer.step()
+				# accumulate the training loss
+				training_loss += loss.item()
+			#print (str(count)+ 'iterations per epoch')
+			self.epoch_counter_train+=1
+			
+			training_loss /= len(self.training_loader)
+			
+			if self.epoch_counter_train % self.validation_freq == 0 or self.epoch_counter_train==1:
+				self.validate(epoch,n_epochs)
+				self.evaluate()
+				print (f'Epoch: {epoch+1}/{n_epochs}.. Training Loss:........ {training_loss}')
+			
+			
+			if self.epoch_counter_train % self.validation_freq == 0 or self.epoch_counter_train==1:
+				self.gradient_average_abs_vec.append(torch.mean(torch.stack(self.gradient_abs_vec)))
+				self.gradient_abs_vec=[]
+				self.gradient_counter.append(self.epoch_counter_train)
+			
+			self.train_loss_vec.append(training_loss)
+
+
+			#print(f'Epoch: {epoch+1}/{n_epochs}.. Training loss: {training_loss}')
+
+
+		train_loss_plot = np.asarray(self.train_loss_vec)
+		train_loss_axis = np.arange(self.epoch_counter_train)
+
+		val_loss_plot = np.asarray(self.val_loss_vec)
+		val_loss_axis = np.asarray(self.epoch_counter_val)
+
+		gradients_plot = np.asarray(self.gradient_average_abs_vec)
+		gradients_axis = np.asarray(self.gradient_counter)
+
+		plt.figure()
+
+		plt.plot(train_loss_axis, train_loss_plot, c='r', label='training loss')
+		plt.plot(val_loss_axis, val_loss_plot, c='g', label='validation loss')
+		# plt.ylim([.9 * np.amin(val_loss_plot), .2 * np.amax(train_loss_plot)])
+		plt.yscale('linear')
+		plt.xlabel('epochs')
+		plt.ylabel('MSE loss')
+		plt.title('Training and Validation loss')
+		plt.grid()
+		plt.legend()
+		plt.savefig(self.data_mode + '/training.pdf')
+		plt.show()
+		
+		plt.figure()
+
+		plt.plot(gradients_axis, gradients_plot, c='b', label='abs val gradients')
+		# plt.ylim([.9 * np.amin(val_loss_plot), .2 * np.amax(train_loss_plot)])
+		plt.yscale('linear')
+		plt.xlabel('epochs')
+		plt.ylabel('mean abs. value')
+		plt.title('Gradients')
+		plt.grid()
+		plt.legend()
+		plt.savefig(self.data_mode + '/gradients.pdf')
+		plt.show()
+
+		
+
+
+
+	def validate(self,epoch,n_epochs):
+		
+		
+		#set the model to eval mode
+		self.model.eval()
+		valid_loss = 0
+		# turn off gradients for validation
+		with torch.no_grad():
+			for data, target in self.validation_loader:
+				# forward pass
+				output = self.model(data)
+				# validation batch loss
+				loss = self.criterion_loss(output, target) 
+				# accumulate the valid_loss
+				valid_loss += loss.item()
+
+
+		valid_loss /= len(self.validation_loader)
+
+		self.val_loss_vec.append(valid_loss)
+		self.epoch_counter_val.append(self.epoch_counter_train)
+		
+
+		print(f'Epoch: {epoch+1}/{n_epochs}.. Validation Loss:........ {valid_loss}')
+
+
+	def evaluate(self):
+		def plot_decision_boundary(X,y):
+			h=0.01
+			xmin, xmax = X[:, 0].min() - .5, X[:, 0].max() + .5
+			ymin, ymax = X[:, 1].min() - .25, X[:, 1].max() + .25
+
+			xx,yy=np.meshgrid(np.arange(xmin,xmax, h), np.arange(ymin, ymax, h))
+			
+			grid=torch.Tensor(np.c_[xx.ravel(),yy.ravel()])
+			
+			# Make predictions across region of interest
+			pred_func=self.model.forward(grid)[:,0]
+			z=pred_func.view(xx.shape).detach().numpy()
+			
+			# Plot decision boundary in region of interest
+			#train_labels = model.forward(X)
+
+			plt.figure('epoch ' + str(self.epoch_counter_train))
+			x0 = X[y[:,0] == 0 ]
+			x1 = X[y[:,0] == 1 ]
+			#plt.figure(figsize=(12,12))
+
+			plt.figure(1)
+			plt.contourf(xx, yy, z, levels=0,colors=['white','lightgrey'])
+			plt.scatter(x0[:,0], x0[:,1],s=.3, c='red', label='y=0')
+			plt.scatter(x1[:,0], x1[:,1],s=.3, c='black', label='y=1')
+			plt.grid()
+		
+		plt.figure('epoch ' + str(self.epoch_counter_train))
+		plot_decision_boundary(self.loaded_data['x_train'], self.loaded_data['y_train'])
+		plt.title('training')
+		plt.savefig(self.data_mode + '/training_evaluation_epoch' +str(self.epoch_counter_train) + '.png')
+		plt.close()
+
+		plt.figure('epoch ' + str(self.epoch_counter_train))
+		plot_decision_boundary(self.loaded_data['x_test'], self.loaded_data['y_test'])
+		plt.title('validation')
+		plt.savefig(self.data_mode + '/validation_evaluation_epoch' +str(self.epoch_counter_train) + '.png')
+		plt.close()
+
+
+# instantiate the model
+model = MyNetwork()
+history = NetworkTrainer()
+
+
+
